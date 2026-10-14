@@ -1,0 +1,174 @@
+---
+title: "Seasonal ET and water use efficiency: WaPOR 100 m"
+format: html
+---
+
+This notebook turns monthly 100 m WaPOR actual-ET rasters into growing-season (September–April) totals for each field. It then averages those totals by sub-region and crop and joins them to yield data to calculate water use efficiency (WUE, kg/m³).
+
+-   A harvest year is processed only when all eight season months are present: September–December of the previous year and January–April of the harvest year.
+-   Each harvest year uses the field-boundary survey (2013, 2017 or 2023) closest to it.
+-   Fields are assigned to sub-regions by spatial join before aggregation.
+
+## 1. Setup
+
+```{r setup}
+library(terra)
+library(sf)
+library(dplyr)
+library(stringr)
+library(readr)
+library(janitor)
+library(ggplot2)
+library(patchwork)
+library(openxlsx)
+
+source("utils.R")
+
+DATA_ROOT <- "../data"   # expected layout is described in the README
+OUT_ROOT <- "../outputs"
+RASTER_ROOT <- file.path(DATA_ROOT, "et", "wapor_100m")
+SUBREGIONS_PATH <- file.path(DATA_ROOT, "subregions", "subregions.shp")
+YIELD_PATH <- file.path(DATA_ROOT, "yield", "yield_data.csv")
+
+ET_SOURCE <- "WAPOR_100m"
+SEASON_LENGTH <- 8   # September to April
+
+dir.create(OUT_ROOT, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 2. Detect harvest years
+
+Raster filenames carry their date as `YYYY_MM` or `YYYYMMDD`. A harvest year is valid when its full growing season is available.
+
+```{r detect_harvest_years}
+get_available_dates <- function(raster_root) {
+  files <- unique(basename(list.files(raster_root, pattern = "\\.tif$", recursive = TRUE)))
+  dates <- str_extract(files, "\\d{4}_\\d{2}|\\d{8}")
+  dates <- str_remove(dates[!is.na(dates)], "_")
+  tibble(
+    year = as.integer(str_sub(dates, 1, 4)),
+    month = as.integer(str_sub(dates, 5, 6))
+  ) |>
+    distinct()
+}
+
+determine_harvest_years <- function(available_dates) {
+  if (nrow(available_dates) == 0) stop("No .tif files with a recognisable date were found.")
+  candidates <- (min(available_dates$year) + 1):max(available_dates$year)
+  Filter(function(h_year) {
+    all(9:12 %in% available_dates$month[available_dates$year == h_year - 1]) &&
+      all(1:4 %in% available_dates$month[available_dates$year == h_year])
+  }, candidates)
+}
+
+get_season_files <- function(harvest_year, raster_folder) {
+  if (!dir.exists(raster_folder)) return(character(0))
+  months <- c(
+    sprintf("%d_?%02d", harvest_year - 1, 9:12),
+    sprintf("%d_?%02d", harvest_year, 1:4)
+  )
+  all_files <- list.files(raster_folder, pattern = "\\.tif$", recursive = TRUE, full.names = TRUE)
+  unique(unlist(lapply(months, function(m) grep(paste0(m, ".*\\.tif$"), all_files, value = TRUE))))
+}
+
+HARVEST_YEARS <- determine_harvest_years(get_available_dates(RASTER_ROOT))
+if (length(HARVEST_YEARS) == 0) stop("No complete harvest years found.")
+cat("Harvest years to process:", HARVEST_YEARS, "\n")
+```
+
+## 3. Load sub-regions and yield data
+
+```{r load_static_data}
+subregions_sf <- st_read(SUBREGIONS_PATH, quiet = TRUE) |> clean_names()
+yield_data <- load_yield(YIELD_PATH)
+```
+
+## 4. Seasonal ET per sub-region and crop
+
+For each harvest year, the eight monthly rasters are summed into a seasonal total. The mean of that total is extracted for every field, and the field means are then averaged per sub-region and crop.
+
+```{r seasonal_et}
+et_results <- list()
+
+for (h_year in HARVEST_YEARS) {
+  survey_year <- closest_survey_year(h_year)
+  cat("\nHarvest year", h_year, "- using", survey_year, "field boundaries\n")
+
+  farms_path <- field_boundary_path(DATA_ROOT, survey_year)
+  if (!file.exists(farms_path)) {
+    warning("Field boundaries not found: ", farms_path, ". Skipping ", h_year)
+    next
+  }
+
+  farms_sf <- st_read(farms_path, quiet = TRUE) |>
+    clean_names() |>
+    st_make_valid() |>
+    mutate(crop_type = canonical_crop(crops)) |>
+    st_transform(st_crs(subregions_sf)) |>
+    st_join(subregions_sf["label"], join = st_intersects) |>
+    rename(sub_region = label)
+
+  # Rasters for each survey year are stored in a subfolder named after that year
+  raster_folder <- file.path(RASTER_ROOT, list.files(RASTER_ROOT, pattern = as.character(survey_year)))
+  season_files <- get_season_files(h_year, raster_folder)
+  if (length(season_files) < SEASON_LENGTH) {
+    warning("Incomplete season rasters for ", h_year, " in ", raster_folder, ". Skipping.")
+    next
+  }
+
+  et_season_total <- app(rast(season_files), fun = "sum", na.rm = TRUE)
+  farms_sf$et_mm <- terra::extract(et_season_total, farms_sf, fun = "mean", ID = FALSE)[[1]]
+
+  et_results[[as.character(h_year)]] <- farms_sf |>
+    st_drop_geometry() |>
+    group_by(sub_region, crop_type) |>
+    summarise(
+      et_sept_apr_sum_mm = mean(et_mm, na.rm = TRUE),
+      n_fields = n(),
+      .groups = "drop"
+    ) |>
+    mutate(yield_year = h_year, survey_year = survey_year, et_source = ET_SOURCE)
+
+  cat("  ", nrow(farms_sf), "fields processed\n")
+}
+
+et_summary <- bind_rows(et_results)
+```
+
+## 5. Join yield and calculate WUE
+
+```{r wue}
+et_wue <- add_yield_and_wue(et_summary, yield_data)
+master_table <- build_master_table(yield_data, et_summary)
+
+write_csv(et_wue, file.path(OUT_ROOT, paste0(ET_SOURCE, "_ET_WUE_Summary.csv")))
+write_csv(master_table, file.path(OUT_ROOT, paste0(ET_SOURCE, "_Master_Table.csv")), na = "")
+write_results_workbook(
+  file.path(OUT_ROOT, paste0(ET_SOURCE, "_Results.xlsx")),
+  yield_data, et_wue, master_table
+)
+```
+
+## 6. Trends
+
+```{r trends, fig.width = 11, fig.height = 4.5}
+median_summary <- et_wue |>
+  filter(!is.na(crop_type), crop_type %in% CROP_TYPES) |>
+  group_by(yield_year, crop_type) |>
+  summarise(
+    med_et_mm = median(et_sept_apr_sum_mm, na.rm = TRUE),
+    med_wue = median(wue_kg_m3, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+trend_plot <- function(y, title, y_label) {
+  ggplot(median_summary, aes(yield_year, {{ y }}, colour = crop_type, group = crop_type)) +
+    geom_line(linewidth = 1.1) +
+    geom_point(size = 2) +
+    theme_minimal(base_size = 13) +
+    labs(title = title, x = "Harvest year", y = y_label, colour = "Crop")
+}
+
+trend_plot(med_et_mm, "Median seasonal ET", "ET (mm)") +
+  trend_plot(med_wue, "Median water use efficiency", "WUE (kg/m³)")
+```

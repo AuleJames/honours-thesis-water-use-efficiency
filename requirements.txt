@@ -1,0 +1,6 @@
+fiona
+geopandas
+numpy
+pandas
+rasterio
+rasterstats

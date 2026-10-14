@@ -1,0 +1,29 @@
+# Data and outputs are never committed
+data/
+outputs/
+*.tif
+*.tiff
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.sbn
+*.sbx
+*.gdb/
+*.xlsx
+*.csv
+
+# R / Quarto
+.Rproj.user/
+.Rhistory
+.RData
+*_files/
+*.html
+.quarto/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

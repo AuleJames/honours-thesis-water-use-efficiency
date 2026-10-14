@@ -1,0 +1,123 @@
+---
+title: "Seasonal ET and water use efficiency: FruitLook 20 m"
+format: html
+---
+
+The same growing-season workflow as the WaPOR notebook, applied to the higher-resolution 20 m FruitLook actual-ET rasters for the earlier harvest years.
+
+There are two differences from the WaPOR notebook:
+
+-   FruitLook coverage is sporadic, so every month available between September and April is used. A harvest year does not need a complete season.
+-   Fields are clipped to sub-region boundaries (intersection) rather than tagged by spatial join, so a field spanning two sub-regions contributes to each.
+
+## 1. Setup
+
+```{r setup}
+library(terra)
+library(sf)
+library(dplyr)
+library(stringr)
+library(readr)
+library(janitor)
+library(openxlsx)
+
+source("utils.R")
+
+DATA_ROOT <- "../data"   # expected layout is described in the README
+OUT_ROOT <- "../outputs"
+RASTER_ROOT <- file.path(DATA_ROOT, "et", "fruitlook_20m")
+SUBREGIONS_PATH <- file.path(DATA_ROOT, "subregions", "subregions.shp")
+YIELD_PATH <- file.path(DATA_ROOT, "yield", "yield_data.csv")
+
+ET_SOURCE <- "Fruitlook_20m"
+
+dir.create(OUT_ROOT, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 2. Raster inventory
+
+FruitLook filenames use one of two date formats: a month name followed by the year (e.g. `october_2014`), or `rYYYY_MM`. Only one raster is kept for each month.
+
+```{r inventory}
+raster_files <- list.files(RASTER_ROOT, pattern = "\\.tif$", recursive = TRUE, full.names = TRUE)
+
+file_inventory <- tibble(filepath = normalizePath(raster_files), fname = tolower(basename(raster_files))) |>
+  mutate(
+    year = as.integer(coalesce(str_extract(fname, "\\d{4}"), str_extract(fname, "(?<=r)\\d{4}"))),
+    month = coalesce(
+      match(str_extract(fname, "[a-z]+(?=_\\d{4})"), tolower(month.name)),
+      as.integer(str_extract(fname, "(?<=r\\d{4}_)\\d{2}"))
+    )
+  ) |>
+  filter(!is.na(year), !is.na(month)) |>
+  distinct(year, month, .keep_all = TRUE)
+
+# September-December belong to the following year's harvest
+harvest_years <- sort(unique(if_else(file_inventory$month >= 9, file_inventory$year + 1L, file_inventory$year)))
+cat("Found", nrow(file_inventory), "monthly rasters covering harvest years:", harvest_years, "\n")
+```
+
+## 3. Seasonal ET per sub-region and crop
+
+```{r seasonal_et}
+subregions_sf <- st_read(SUBREGIONS_PATH, quiet = TRUE)
+yield_data <- load_yield(YIELD_PATH)
+
+et_results <- list()
+
+for (h_year in harvest_years) {
+  survey_year <- closest_survey_year(h_year)
+  season_files <- file_inventory |>
+    filter((year == h_year - 1 & month >= 9) | (year == h_year & month <= 4))
+
+  cat("\nHarvest year", h_year, "-", nrow(season_files), "rasters,", survey_year, "field boundaries\n")
+  if (nrow(season_files) == 0) next
+
+  # Rasters are monthly totals (mm), so the seasonal total is their sum
+  et_season_total <- sum(rast(season_files$filepath))
+  raster_crs <- st_crs(crs(et_season_total))
+
+  farms_sf <- st_read(field_boundary_path(DATA_ROOT, survey_year), quiet = TRUE) |>
+    mutate(crop_type = canonical_crop(CROPS)) |>
+    filter(crop_type %in% CROP_TYPES) |>
+    st_transform(raster_crs) |>
+    st_make_valid()
+
+  farms_in_regions <- st_intersection(farms_sf, st_make_valid(st_transform(subregions_sf, raster_crs)))
+  if (nrow(farms_in_regions) == 0) {
+    cat("  No overlap between fields and sub-regions. Skipping.\n")
+    next
+  }
+
+  farms_in_regions$et_mm <- terra::extract(
+    et_season_total, vect(farms_in_regions), fun = mean, na.rm = TRUE, ID = FALSE
+  )[[1]]
+
+  et_results[[as.character(h_year)]] <- farms_in_regions |>
+    st_drop_geometry() |>
+    group_by(sub_region = Label, crop_type) |>
+    summarise(
+      et_sept_apr_sum_mm = mean(et_mm, na.rm = TRUE),
+      n_fields = n(),
+      .groups = "drop"
+    ) |>
+    mutate(yield_year = h_year, survey_year = survey_year, et_source = ET_SOURCE)
+}
+
+et_summary <- bind_rows(et_results)
+print(et_summary)
+```
+
+## 4. Join yield and calculate WUE
+
+```{r wue}
+et_wue <- add_yield_and_wue(et_summary, yield_data)
+master_table <- build_master_table(yield_data, et_summary)
+
+write_csv(et_wue, file.path(OUT_ROOT, paste0(ET_SOURCE, "_ET_WUE_Summary.csv")))
+write_csv(master_table, file.path(OUT_ROOT, paste0(ET_SOURCE, "_Master_Table.csv")), na = "")
+write_results_workbook(
+  file.path(OUT_ROOT, paste0(ET_SOURCE, "_Results.xlsx")),
+  yield_data, et_wue, master_table
+)
+```
